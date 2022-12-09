@@ -45,6 +45,54 @@ end
 
 _convert(::Type{T}, @nospecialize(x)) where {T} = convert(T, x)::T
 
+# For each (V, B) in this list, if Julia has libstdc++ loaded at version at least V, then
+# B is a compatible bound for libstdcxx_ng.
+# See https://gcc.gnu.org/onlinedocs/libstdc++/manual/abi.html.
+# See https://gcc.gnu.org/develop.html#timeline.
+const _compatible_libstdcxx_ng_versions = [
+    (v"3.4.31", ">=3.4,<=13.1"),
+    (v"3.4.30", ">=3.4,<13.0"),
+    (v"3.4.29", ">=3.4,<12.0"),
+    (v"3.4.28", ">=3.4,<11.0"),
+    (v"3.4.27", ">=3.4,<9.3"),
+    (v"3.4.26", ">=3.4,<9.2"),
+    (v"3.4.25", ">=3.4,<9.0"),
+    (v"3.4.24", ">=3.4,<8.0"),
+    (v"3.4.23", ">=3.4,<7.2"),
+    (v"3.4.22", ">=3.4,<7.0"),
+    (v"3.4.21", ">=3.4,<6.0"),
+    (v"3.4.20", ">=3.4,<5.0"),
+    (v"3.4.19", ">=3.4,<4.9"),
+]
+
+"""
+    _compatible_libstdcxx_ng_version()
+
+Version of libstdcxx-ng compatible with the libstdc++ loaded into Julia.
+
+Specifying the package "libstdcxx-ng" with version "<=julia" will replace the version with
+this one. This should be used by anything which embeds Python into the Julia process - for
+instance it is used by PythonCall.
+"""
+function _compatible_libstdcxx_ng_version()
+    if !Sys.islinux()
+        return
+    end
+    # bound = get(ENV, "JULIA_CONDAPKG_LIBSTDCXX_VERSION_BOUND", "")
+    # if bound != ""
+    #     return bound
+    # end
+    loaded_libstdcxx_version = Base.BinaryPlatforms.detect_libstdcxx_version()
+    if loaded_libstdcxx_version === nothing
+        return
+    end
+    for (version, bound) in _compatible_libstdcxx_ng_versions
+        if loaded_libstdcxx_version ≥ version
+            return bound
+        end
+    end
+end
+
 function _resolve_find_dependencies(io, load_path)
     packages = Dict{String,Dict{String,PkgSpec}}() # name -> depsfile -> spec
     channels = ChannelSpec[]
@@ -58,6 +106,11 @@ function _resolve_find_dependencies(io, load_path)
             _log(io, "Found dependencies: $fn")
             pkgs, chans, pippkgs = read_parsed_deps(fn)
             for pkg in pkgs
+                if pkg.name == "libstdcxx-ng" && pkg.version == "<=julia"
+                    version = _compatible_libstdcxx_ng_version()
+                    version === nothing && continue
+                    pkg = PkgSpec(pkg; version)
+                end
                 get!(Dict{String,PkgSpec}, packages, pkg.name)[fn] = pkg
             end
             if isempty(chans)
@@ -172,7 +225,7 @@ function _resolve_pip_diff(old_specs, new_specs)
 end
 
 function _verbosity()
-    parse(Int, get(ENV, "JULIA_CONDAPKG_VERBOSITY", "-1"))
+    parse(Int, get(ENV, "JULIA_CONDAPKG_VERBOSITY", "0"))
 end
 
 function _verbosity_flags()
@@ -318,7 +371,8 @@ function resolve(; force::Bool=false, io::IO=stderr, interactive::Bool=false, dr
         return
     end
     # if backend is Null, assume resolved
-    if backend() == :Null
+    back = backend()
+    if back == :Null
         interactive && _log(io, "Using the Null backend, nothing to do")
         STATE.resolved = true
         return
@@ -332,12 +386,21 @@ function resolve(; force::Bool=false, io::IO=stderr, interactive::Bool=false, dr
     end
     STATE.resolved = false
     STATE.load_path = load_path
-    # find the topmost env in the load_path which depends on CondaPkg
-    top_env = _resolve_top_env(load_path)
-    STATE.meta_dir = meta_dir = joinpath(top_env, ".CondaPkg")
+    if back == :Current
+        # use a pre-existing conda environment
+        conda_env = get(ENV, "CONDA_PREFIX", "")
+        if conda_env == ""
+            error("CondaPkg is using the Current backend, but you are not in a Conda environment")
+        end
+        STATE.meta_dir = meta_dir = joinpath(conda_env, ".JuliaCondaPkg")
+    else
+        # find the topmost env in the load_path which depends on CondaPkg
+        top_env = _resolve_top_env(load_path)
+        STATE.meta_dir = meta_dir = joinpath(top_env, ".CondaPkg")
+        conda_env = joinpath(meta_dir, "env")
+    end
     meta_file = joinpath(meta_dir, "meta")
     lock_file = joinpath(meta_dir, "lock")
-    conda_env = joinpath(meta_dir, "env")
     # grap a file lock so only one process can resolve this environment at a time
     mkpath(meta_dir)
     lock = try
@@ -358,7 +421,7 @@ function resolve(; force::Bool=false, io::IO=stderr, interactive::Bool=false, dr
         (packages, channels, pip_packages, extra_path) = _resolve_find_dependencies(io, load_path)
         # install pip if there are pip packages to install
         if !isempty(pip_packages) && !haskey(packages, "pip")
-            get!(Dict{String,PkgSpec}, packages, "pip")["<internal>"] = PkgSpec("pip")
+            get!(Dict{String,PkgSpec}, packages, "pip")["<internal>"] = PkgSpec("pip", version=">=22.0.0")
             if !any(c.name in ("conda-forge", "anaconda") for c in channels)
                 push!(channels, ChannelSpec("conda-forge"))
             end
@@ -372,7 +435,7 @@ function resolve(; force::Bool=false, io::IO=stderr, interactive::Bool=false, dr
         pip_specs = _resolve_merge_pip_packages(pip_packages)
         # find what has changed
         meta = isfile(meta_file) ? open(read_meta, meta_file) : nothing
-        if meta === nothing
+        if (meta === nothing) || (back == :Current)
             removed_pkgs = String[]
             changed_pkgs = String[]
             added_pkgs = unique!(String[x.name for x in specs])
@@ -384,7 +447,7 @@ function resolve(; force::Bool=false, io::IO=stderr, interactive::Bool=false, dr
             removed_pip_pkgs, changed_pip_pkgs, added_pip_pkgs = _resolve_pip_diff(meta.pip_packages, pip_specs)
         end
         changes = sort([
-            (i>3 ? "$pkg (pip)" : pkg, mod1(i,3))
+            (i>3 ? "$pkg (pip)" : pkg, mod1(i, 3))
             for (i, pkgs) in enumerate([added_pkgs, changed_pkgs, removed_pkgs, added_pip_pkgs, changed_pip_pkgs, removed_pip_pkgs])
             for pkg in pkgs
         ])
@@ -402,15 +465,17 @@ function resolve(; force::Bool=false, io::IO=stderr, interactive::Bool=false, dr
             end
         end
         # install/uninstall packages
-        if !force && meta !== nothing && stat(conda_env).mtime < meta.timestamp && (isdir(conda_env) || (isempty(meta.packages) && isempty(meta.pip_packages)))
+        if (back == :Current) || (!force && meta !== nothing && stat(conda_env).mtime < meta.timestamp && (isdir(conda_env) || (isempty(meta.packages) && isempty(meta.pip_packages))))
             # the state is sufficiently clean that we can modify the existing conda environment
             changed = false
             if !isempty(removed_pip_pkgs)
+                @assert back != :Current
                 dry_run && return
                 changed = true
                 _resolve_pip_remove(io, removed_pip_pkgs, load_path)
             end
             if !isempty(removed_pkgs)
+                @assert back != :Current
                 dry_run && return
                 changed = true
                 _resolve_conda_remove(io, conda_env, removed_pkgs)
